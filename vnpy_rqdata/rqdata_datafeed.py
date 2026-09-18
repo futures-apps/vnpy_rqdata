@@ -1,20 +1,21 @@
-from datetime import datetime, timedelta
-from typing import cast
+from datetime import date, datetime, timedelta
+from typing import Any, cast
 from collections.abc import Callable
+from zoneinfo import ZoneInfo
 
 from numpy import ndarray
 from pandas import DataFrame, Timestamp
-from rqdatac import init
+from rqdatac import init, instruments
 from rqdatac.services.get_price import get_price
 from rqdatac.services.future import get_dominant_price
 from rqdatac.services.basic import all_instruments
-from rqdatac.services.calendar import get_next_trading_date
+from rqdatac.services.calendar import get_next_trading_date, get_trading_dates
 from rqdatac.share.errors import RQDataError
 
 from vnpy.trader.setting import SETTINGS
 from vnpy.trader.constant import Exchange, Interval
 from vnpy.trader.object import BarData, TickData, HistoryRequest
-from vnpy.trader.utility import round_to, ZoneInfo
+from vnpy.trader.utility import round_to
 from vnpy.trader.datafeed import BaseDatafeed
 
 
@@ -142,6 +143,8 @@ class RqdataDatafeed(BaseDatafeed):
         self.password: str = SETTINGS["datafeed.password"]
 
         self.inited: bool = False
+        self.instruments: DataFrame = DataFrame()
+        self.instrument_exchanges: dict[str, str] = {}
 
     def init(self, output: Callable = print) -> bool:
         """初始化"""
@@ -166,8 +169,8 @@ class RqdataDatafeed(BaseDatafeed):
                 auto_load_plugins=False
             )
 
-            df: DataFrame = all_instruments()
-            self.symbols: ndarray = df["order_book_id"].to_numpy()
+            self.instruments = all_instruments()
+            self.symbols: ndarray = self.instruments["order_book_id"].to_numpy()
         except RQDataError as ex:
             output(f"RQData数据服务初始化失败：{ex}")
             return False
@@ -180,6 +183,41 @@ class RqdataDatafeed(BaseDatafeed):
 
         self.inited = True
         return True
+
+    def get_instrument_exchanges(self, order_book_ids: list[str]) -> dict[str, str]:
+        """Resolve RQData exchanges in one batch and cache the result."""
+        missing = [item for item in order_book_ids if item not in self.instrument_exchanges]
+        if missing:
+            resolved = instruments(missing)
+            if not isinstance(resolved, list):
+                resolved = [resolved]
+            self.instrument_exchanges.update(
+                {
+                    item.order_book_id: item.exchange
+                    for item in resolved
+                    if item is not None and getattr(item, "exchange", None)
+                }
+            )
+        return {
+            order_book_id: self.instrument_exchanges[order_book_id]
+            for order_book_id in order_book_ids
+            if order_book_id in self.instrument_exchanges
+        }
+
+    def is_trading_day(self, value: date) -> bool:
+        """Return whether the date is in RQData's Chinese trading calendar."""
+        if not self.inited and not self.init():
+            raise RuntimeError("RQData 数据服务初始化失败")
+        return len(get_trading_dates(value, value)) > 0
+
+    def get_trading_days(self, start: date, end: date) -> tuple[date, ...]:
+        """Return a date range using a single RQData calendar request."""
+        if not self.inited and not self.init():
+            raise RuntimeError("RQData 数据服务初始化失败")
+        return tuple(
+            cast(Any, value).date() if hasattr(value, "date") else value
+            for value in get_trading_dates(start, end)
+        )
 
     def query_bar_history(self, req: HistoryRequest, output: Callable = print) -> list[BarData] | None:
         """查询K线数据"""
@@ -198,9 +236,9 @@ class RqdataDatafeed(BaseDatafeed):
 
         symbol: str = req.symbol
         exchange: Exchange = req.exchange
-        interval: Interval = req.interval
+        interval: Interval = cast(Interval, req.interval)
         start: datetime = to_china_tz(req.start)
-        end: datetime = to_china_tz(req.end)
+        end: datetime = to_china_tz(cast(datetime, req.end))
 
         # 股票期权不添加交易所后缀
         if exchange in [Exchange.SSE, Exchange.SZSE] and symbol in self.symbols:
@@ -215,7 +253,7 @@ class RqdataDatafeed(BaseDatafeed):
 
         rq_interval: str | None = INTERVAL_VT2RQ.get(interval, None)
         if not rq_interval:
-            output(f"RQData查询K线数据失败：不支持的时间周期{req.interval.value}")
+            output(f"RQData查询K线数据失败：不支持的时间周期{interval.value}")
             return []
 
         # 为了将米筐时间戳（K线结束时点）转换为VeighNa时间戳（K线开始时点）
@@ -232,14 +270,14 @@ class RqdataDatafeed(BaseDatafeed):
         else:
             adjust_type = "none"
 
-        df: DataFrame = get_price(
+        df = cast(DataFrame | None, get_price(
             rq_symbol,
             frequency=rq_interval,
             fields=fields,
             start_date=start,
             end_date=get_next_trading_date(end),        # 为了查询夜盘数据
             adjust_type=adjust_type
-        )
+        ))
 
         data: list[BarData] = []
 
@@ -247,7 +285,8 @@ class RqdataDatafeed(BaseDatafeed):
             # 填充NaN为0
             df.fillna(0, inplace=True)
 
-            for row in df.itertuples():
+            for raw_row in df.itertuples():
+                row: Any = raw_row
                 row_index: tuple[str, Timestamp] = cast(tuple[str, Timestamp], row.Index)
                 dt: datetime = row_index[1].to_pydatetime() - adjustment
                 dt = dt.replace(tzinfo=CHINA_TZ)
@@ -284,7 +323,7 @@ class RqdataDatafeed(BaseDatafeed):
         symbol: str = req.symbol
         exchange: Exchange = req.exchange
         start: datetime = to_china_tz(req.start)
-        end: datetime = to_china_tz(req.end)
+        end: datetime = to_china_tz(cast(datetime, req.end))
 
         # 股票期权不添加交易所后缀
         if exchange in [Exchange.SSE, Exchange.SZSE] and symbol in self.symbols:
@@ -331,14 +370,14 @@ class RqdataDatafeed(BaseDatafeed):
         if not symbol.isdigit():
             fields.append("open_interest")
 
-        df: DataFrame = get_price(
+        df = cast(DataFrame | None, get_price(
             rq_symbol,
             frequency="tick",
             fields=fields,
             start_date=start,
             end_date=get_next_trading_date(end),        # 为了查询夜盘数据
             adjust_type="none"
-        )
+        ))
 
         data: list[TickData] = []
 
@@ -346,7 +385,8 @@ class RqdataDatafeed(BaseDatafeed):
             # 填充NaN为0
             df.fillna(0, inplace=True)
 
-            for row in df.itertuples():
+            for raw_row in df.itertuples():
+                row: Any = raw_row
                 row_index: tuple[str, Timestamp] = cast(tuple[str, Timestamp], row.Index)
                 dt: datetime = row_index[1].to_pydatetime()
                 dt = dt.replace(tzinfo=CHINA_TZ)
@@ -404,13 +444,13 @@ class RqdataDatafeed(BaseDatafeed):
 
         symbol: str = req.symbol
         exchange: Exchange = req.exchange
-        interval: Interval = req.interval
+        interval: Interval = cast(Interval, req.interval)
         start: datetime = to_china_tz(req.start)
-        end: datetime = to_china_tz(req.end)
+        end: datetime = to_china_tz(cast(datetime, req.end))
 
         rq_interval: str | None = INTERVAL_VT2RQ.get(interval, None)
         if not rq_interval:
-            output(f"RQData查询K线数据失败：不支持的时间周期{req.interval.value}")
+            output(f"RQData查询K线数据失败：不支持的时间周期{interval.value}")
             return []
 
         # 为了将米筐时间戳（K线结束时点）转换为VeighNa时间戳（K线开始时点）
@@ -421,7 +461,7 @@ class RqdataDatafeed(BaseDatafeed):
         if not symbol.isdigit():
             fields.append("open_interest")
 
-        df: DataFrame = get_dominant_price(
+        df = cast(DataFrame | None, get_dominant_price(
             symbol.upper(),                         # 合约代码用大写
             frequency=rq_interval,
             fields=fields,
@@ -429,7 +469,7 @@ class RqdataDatafeed(BaseDatafeed):
             end_date=get_next_trading_date(end),    # 为了查询夜盘数据
             adjust_type="pre",                      # 前复权
             adjust_method="prev_close_ratio"        # 切换前一日收盘价比例复权
-        )
+        ))
 
         data: list[BarData] = []
 
@@ -437,7 +477,8 @@ class RqdataDatafeed(BaseDatafeed):
             # 填充NaN为0
             df.fillna(0, inplace=True)
 
-            for row in df.itertuples():
+            for raw_row in df.itertuples():
+                row: Any = raw_row
                 row_index: tuple[str, Timestamp] = cast(tuple[str, Timestamp], row.Index)
                 dt: datetime = row_index[1].to_pydatetime() - adjustment
                 dt = dt.replace(tzinfo=CHINA_TZ)
