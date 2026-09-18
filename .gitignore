@@ -38,3 +38,6 @@ x64/
 
 .vscode/settings.json
 /.mypy_cache
+
+# cache files
+.ruff_cache/
