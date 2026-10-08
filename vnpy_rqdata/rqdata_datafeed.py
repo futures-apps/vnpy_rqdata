@@ -1,11 +1,12 @@
-from datetime import date, datetime, timedelta
+import re
+from datetime import date, datetime, time, timedelta
 from typing import Any, cast
 from collections.abc import Callable
 from zoneinfo import ZoneInfo
 
 from numpy import ndarray
 from pandas import DataFrame, Timestamp
-from rqdatac import init, instruments
+from rqdatac import get_trading_periods, init, instruments
 from rqdatac.services.get_price import get_price
 from rqdatac.services.future import get_dominant_price
 from rqdatac.services.basic import all_instruments
@@ -41,6 +42,20 @@ FUTURES_EXCHANGES: set[Exchange] = {
 }
 
 CHINA_TZ = ZoneInfo("Asia/Shanghai")
+RQ_EXCHANGE_TO_VT: dict[str, str] = {
+    "CCFX": "CFFEX",
+    "CFFEX": "CFFEX",
+    "XSGE": "SHFE",
+    "SHFE": "SHFE",
+    "XZCE": "CZCE",
+    "CZCE": "CZCE",
+    "XDCE": "DCE",
+    "DCE": "DCE",
+    "XINE": "INE",
+    "INE": "INE",
+    "GFEX": "GFEX",
+}
+STANDARD_FUTURES_PATTERN = re.compile(r"^[A-Za-z]+[0-9]{4}$")
 
 
 def to_china_tz(dt: datetime) -> datetime:
@@ -49,6 +64,20 @@ def to_china_tz(dt: datetime) -> datetime:
         return dt.replace(tzinfo=CHINA_TZ)
     dt = dt.astimezone(CHINA_TZ)
     return dt
+
+
+def _parse_trading_hours(text: str) -> list[tuple[time, time]]:
+    """解析形如 "09:31-11:30,13:01-15:00" 的交易时间段字符串"""
+    sessions: list[tuple[time, time]] = []
+    for part in text.split(","):
+        start_text, separator, end_text = part.strip().partition("-")
+        if not separator:
+            continue
+        try:
+            sessions.append((time.fromisoformat(start_text.strip()), time.fromisoformat(end_text.strip())))
+        except ValueError:
+            continue
+    return sessions
 
 
 def to_rq_symbol(symbol: str, exchange: Exchange, all_symbols: ndarray) -> str:
@@ -218,6 +247,145 @@ class RqdataDatafeed(BaseDatafeed):
             cast(Any, value).date() if hasattr(value, "date") else value
             for value in get_trading_dates(start, end)
         )
+
+    def get_trading_session_snapshot(
+        self, vt_symbols: list[str], trading_date: date, output: Callable = print
+    ) -> dict[str, dict[str, Any]]:
+        """Resolve each vt_symbol's exchange-defined session times and instrument status for one date."""
+        if not self.inited and not self.init(output):
+            raise RuntimeError("RQData 数据服务初始化失败")
+        order_book_id_by_vt_symbol: dict[str, str] = {}
+        for vt_symbol in vt_symbols:
+            symbol, separator, exchange_value = vt_symbol.rpartition(".")
+            if not separator:
+                continue
+            try:
+                exchange = Exchange(exchange_value)
+            except ValueError:
+                continue
+            order_book_id_by_vt_symbol[vt_symbol] = to_rq_symbol(symbol, exchange, self.symbols)
+        if not order_book_id_by_vt_symbol:
+            return {}
+
+        order_book_ids = list(dict.fromkeys(order_book_id_by_vt_symbol.values()))
+        trading_hours = self._trading_hours_by_order_book_id(order_book_ids, trading_date)
+        statuses = self._instrument_status_by_order_book_id(order_book_ids, trading_date)
+        return {
+            vt_symbol: {
+                "sessions": _parse_trading_hours(trading_hours.get(order_book_id, "")),
+                "status": statuses.get(order_book_id, "Unknown"),
+            }
+            for vt_symbol, order_book_id in order_book_id_by_vt_symbol.items()
+        }
+
+    def get_all_futures_trading_sessions(
+        self, trading_date: date, output: Callable = print
+    ) -> dict[str, dict[str, Any]]:
+        """Return session periods and status for every listed domestic futures contract."""
+        if not self.inited and not self.init(output):
+            raise RuntimeError("RQData 数据服务初始化失败")
+        candidates: list[tuple[str, Any]] = []
+        for row in self.instruments.itertuples(index=False):
+            if "future" not in str(getattr(row, "type", "")).lower():
+                continue
+            order_book_id = str(getattr(row, "order_book_id", "")).strip()
+            if not STANDARD_FUTURES_PATTERN.fullmatch(order_book_id):
+                continue
+            listed_date = self._optional_date(getattr(row, "listed_date", None))
+            de_listed_date = self._optional_date(getattr(row, "de_listed_date", None))
+            if listed_date and listed_date > trading_date:
+                continue
+            if de_listed_date and de_listed_date < trading_date:
+                continue
+            candidates.append((order_book_id, row))
+
+        exchange_by_symbol: dict[str, str] = {}
+        if "exchange" not in self.instruments.columns:
+            exchange_by_symbol = self.get_instrument_exchanges(
+                [order_book_id for order_book_id, _ in candidates]
+            )
+        contracts: dict[str, tuple[str, str]] = {}
+        for order_book_id, row in candidates:
+            raw_exchange = exchange_by_symbol.get(
+                order_book_id, str(getattr(row, "exchange", ""))
+            )
+            exchange = RQ_EXCHANGE_TO_VT.get(raw_exchange)
+            if exchange is None:
+                continue
+            symbol = order_book_id if exchange in {"CFFEX", "CZCE"} else order_book_id.lower()
+            contracts[order_book_id] = (symbol, exchange)
+
+        result: dict[str, dict[str, Any]] = {}
+        order_book_ids = list(contracts)
+        for offset in range(0, len(order_book_ids), 200):
+            batch = order_book_ids[offset : offset + 200]
+            trading_hours = self._trading_hours_by_order_book_id(batch, trading_date)
+            statuses = self._instrument_status_by_order_book_id(batch, trading_date)
+            for order_book_id in batch:
+                symbol, exchange = contracts[order_book_id]
+                result[f"{symbol}.{exchange}"] = {
+                    "symbol": symbol,
+                    "exchange": exchange,
+                    "sessions": _parse_trading_hours(trading_hours.get(order_book_id, "")),
+                    "status": statuses.get(order_book_id, "Unknown"),
+                }
+        return result
+
+    @staticmethod
+    def _optional_date(value: Any) -> date | None:
+        text = str(value).strip()
+        if not text or text.lower() in {"nat", "nan", "none"} or text.startswith("0000-"):
+            return None
+        if hasattr(value, "date"):
+            parsed = value.date()
+            if isinstance(parsed, date):
+                return parsed
+        try:
+            return date.fromisoformat(text[:10])
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _trading_hours_by_order_book_id(order_book_ids: list[str], trading_date: date) -> dict[str, str]:
+        # frequency="tick" returns the exchange-defined session times rather than bar boundaries.
+        frame = cast(
+            DataFrame | None,
+            get_trading_periods(order_book_ids, start_date=trading_date, end_date=trading_date, frequency="tick"),
+        )
+        if frame is None or frame.empty:
+            return {}
+        result: dict[str, str] = {}
+        for index, row in frame.iterrows():
+            order_book_id = index[0] if isinstance(index, tuple) else index
+            result[str(order_book_id)] = str(row["trading_hours"])
+        return result
+
+    @staticmethod
+    def _instrument_status_by_order_book_id(
+        order_book_ids: list[str], trading_date: date
+    ) -> dict[str, str]:
+        resolved = instruments(order_book_ids)
+        if not isinstance(resolved, list):
+            resolved = [resolved]
+        statuses: dict[str, str] = {}
+        for item in resolved:
+            if item is None:
+                continue
+            status = str(getattr(item, "status", "")).strip()
+            if status and status.lower() not in {"nan", "none"}:
+                statuses[item.order_book_id] = status
+                continue
+            listed_date = RqdataDatafeed._optional_date(getattr(item, "listed_date", None))
+            de_listed_date = RqdataDatafeed._optional_date(
+                getattr(item, "de_listed_date", None)
+            )
+            if listed_date and listed_date > trading_date:
+                statuses[item.order_book_id] = "NotListed"
+            elif de_listed_date and de_listed_date < trading_date:
+                statuses[item.order_book_id] = "Delisted"
+            else:
+                statuses[item.order_book_id] = "Active"
+        return statuses
 
     def query_bar_history(self, req: HistoryRequest, output: Callable = print) -> list[BarData] | None:
         """查询K线数据"""
