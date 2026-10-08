@@ -41,3 +41,7 @@ x64/
 
 # cache files
 .ruff_cache/
+
+# test files
+tests/
+test/
