@@ -284,18 +284,17 @@ class RqdataDatafeed(BaseDatafeed):
         """Return session periods and status for every listed domestic futures contract."""
         if not self.inited and not self.init(output):
             raise RuntimeError("RQData 数据服务初始化失败")
+        refreshed = all_instruments()
+        if refreshed is None or refreshed.empty:
+            raise RuntimeError("RQData returned an empty futures catalog")
+        self.instruments = refreshed
+        self.symbols = refreshed["order_book_id"].to_numpy()
         candidates: list[tuple[str, Any]] = []
         for row in self.instruments.itertuples(index=False):
             if "future" not in str(getattr(row, "type", "")).lower():
                 continue
             order_book_id = str(getattr(row, "order_book_id", "")).strip()
             if not STANDARD_FUTURES_PATTERN.fullmatch(order_book_id):
-                continue
-            listed_date = self._optional_date(getattr(row, "listed_date", None))
-            de_listed_date = self._optional_date(getattr(row, "de_listed_date", None))
-            if listed_date and listed_date > trading_date:
-                continue
-            if de_listed_date and de_listed_date < trading_date:
                 continue
             candidates.append((order_book_id, row))
 
@@ -316,18 +315,56 @@ class RqdataDatafeed(BaseDatafeed):
             contracts[order_book_id] = (symbol, exchange)
 
         result: dict[str, dict[str, Any]] = {}
+        metadata = {order_book_id: row for order_book_id, row in candidates}
+        calendar = self.get_trading_days(trading_date - timedelta(days=40), trading_date)
+        previous_date = next((value for value in reversed(calendar) if value < trading_date), None)
+        is_trading_date = trading_date in calendar
         order_book_ids = list(contracts)
         for offset in range(0, len(order_book_ids), 200):
             batch = order_book_ids[offset : offset + 200]
-            trading_hours = self._trading_hours_by_order_book_id(batch, trading_date)
-            statuses = self._instrument_status_by_order_book_id(batch, trading_date)
+            resolved = instruments(batch)
+            if not isinstance(resolved, list):
+                resolved = [resolved]
+            details = {item.order_book_id: item for item in resolved if item is not None}
+            active: list[str] = []
+            for order_book_id in batch:
+                item = details.get(order_book_id, metadata[order_book_id])
+                listed = self._optional_date(getattr(item, "listed_date", None))
+                last = self._optional_date(getattr(item, "de_listed_date", None))
+                if listed is None or last is None or listed > last:
+                    raise ValueError(f"RQData missing/invalid lifecycle: {order_book_id}")
+                if listed <= trading_date <= last:
+                    active.append(order_book_id)
+            trading_hours = self._trading_hours_by_order_book_id(active, trading_date) if active and is_trading_date else {}
             for order_book_id in batch:
                 symbol, exchange = contracts[order_book_id]
+                item = details.get(order_book_id, metadata[order_book_id])
+                listed = self._optional_date(getattr(item, "listed_date", None))
+                last = self._optional_date(getattr(item, "de_listed_date", None))
+                status = str(getattr(item, "status", "") or "Active")
+                if status.lower() in {"nan", "none", "unknown", "delisted", "de_listed", "notlisted"}:
+                    status = "Active"
+                if listed and trading_date < listed:
+                    status = "NotListed"
+                elif last and trading_date > last:
+                    status = "Delisted"
+                raw_hours = trading_hours.get(order_book_id, "")
+                sessions = _parse_trading_hours(raw_hours)
+                if raw_hours and len(sessions) != len(raw_hours.split(",")):
+                    raise ValueError(f"RQData invalid trading periods: {order_book_id}")
+                if is_trading_date and order_book_id in active and status.lower() in {"active", "trading"} and not sessions:
+                    raise ValueError(f"RQData missing trading periods: {order_book_id}")
                 result[f"{symbol}.{exchange}"] = {
                     "symbol": symbol,
                     "exchange": exchange,
-                    "sessions": _parse_trading_hours(trading_hours.get(order_book_id, "")),
-                    "status": statuses.get(order_book_id, "Unknown"),
+                    "sessions": sessions,
+                    "status": status,
+                    "listed_date": listed,
+                    "last_trading_date": last,
+                    "individual_last_trading_date": self._optional_date(getattr(item, "individual_last_trading_date", None)),
+                    "institutional_last_trading_date": self._optional_date(getattr(item, "institutional_last_trading_date", None)) or last,
+                    "delivery_date": self._optional_date(getattr(item, "delivery_date", None)),
+                    "previous_trading_date": previous_date,
                 }
         return result
 
