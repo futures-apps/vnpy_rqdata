@@ -113,7 +113,7 @@ def to_rq_symbol(symbol: str, exchange: Exchange, all_symbols: ndarray) -> str:
         # 期货
         if time_str.isdigit():
             # 只有郑商所需要特殊处理
-            if exchange is not Exchange.CZCE:
+            if exchange is not Exchange.CZCE or len(time_str) == 4:
                 return symbol.upper()
 
             # 检查是否为连续合约或者指数合约
