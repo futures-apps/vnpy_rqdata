@@ -1,7 +1,11 @@
+import os
 import re
+from math import gcd
 from datetime import date, datetime, time, timedelta
 from typing import Any, cast
 from collections.abc import Callable
+from contextlib import nullcontext
+from time import monotonic, sleep
 from zoneinfo import ZoneInfo
 
 from numpy import ndarray
@@ -56,6 +60,35 @@ RQ_EXCHANGE_TO_VT: dict[str, str] = {
     "GFEX": "GFEX",
 }
 STANDARD_FUTURES_PATTERN = re.compile(r"^[A-Za-z]+[0-9]{4}$")
+STANDARD_OPTIONS_PATTERN = re.compile(r"^([A-Za-z]+)([0-9]{4})-?([CPcp])-?([0-9]+(?:\.[0-9]+)?)$")
+TRADING_SESSION_CONTRACT_DETAIL_BATCH_SIZE = "TRADING_SESSION_CONTRACT_DETAIL_BATCH_SIZE"
+TRADING_SESSION_CONTRACT_DETAIL_REQUEST_INTERVAL_MS = "TRADING_SESSION_CONTRACT_DETAIL_REQUEST_INTERVAL_MS"
+HISTORY_TICK_FIELDS = [
+    "open", "high", "low", "last", "prev_close", "volume", "total_turnover",
+    "limit_up", "limit_down", "b1", "b2", "b3", "b4", "b5",
+    "a1", "a2", "a3", "a4", "a5", "b1_v", "b2_v", "b3_v", "b4_v", "b5_v",
+    "a1_v", "a2_v", "a3_v", "a4_v", "a5_v",
+]
+
+
+def contract_detail_batch_size() -> int:
+    try:
+        value = int(os.getenv(TRADING_SESSION_CONTRACT_DETAIL_BATCH_SIZE, "200"))
+    except ValueError:
+        raise ValueError(f"{TRADING_SESSION_CONTRACT_DETAIL_BATCH_SIZE} must be an integer") from None
+    if not 1 <= value <= 100_000:
+        raise ValueError(f"{TRADING_SESSION_CONTRACT_DETAIL_BATCH_SIZE} must be between 1 and 100000")
+    return value
+
+
+def contract_detail_request_interval_ms() -> int:
+    try:
+        value = int(os.getenv(TRADING_SESSION_CONTRACT_DETAIL_REQUEST_INTERVAL_MS, "200"))
+    except ValueError:
+        raise ValueError(f"{TRADING_SESSION_CONTRACT_DETAIL_REQUEST_INTERVAL_MS} must be an integer") from None
+    if not 0 <= value <= 60_000:
+        raise ValueError(f"{TRADING_SESSION_CONTRACT_DETAIL_REQUEST_INTERVAL_MS} must be between 0 and 60000")
+    return value
 
 
 def to_china_tz(dt: datetime) -> datetime:
@@ -103,6 +136,14 @@ def to_rq_symbol(symbol: str, exchange: Exchange, all_symbols: ndarray) -> str:
         Exchange.INE,
         Exchange.GFEX
     }:
+        option = re.fullmatch(r"([A-Za-z]+)([0-9]{3,4})-?([CPcp])-?([0-9]+(?:\.[0-9]+)?)", symbol)
+        if option is not None:
+            product, delivery, right, strike = option.groups()
+            compact = f"{product}{delivery}{right}{strike}".upper()
+            if exchange is not Exchange.CZCE or len(delivery) == 4:
+                return compact
+            candidates = [f"{product}{decade}{delivery}{right}{strike}".upper() for decade in ("2", "1")]
+            return next((candidate for candidate in candidates if candidate in all_symbols), candidates[-1])
         for count, word in enumerate(symbol):  # noqa: B007
             if word.isdigit():
                 break
@@ -174,12 +215,68 @@ class RqdataDatafeed(BaseDatafeed):
         self.inited: bool = False
         self.instruments: DataFrame = DataFrame()
         self.instrument_exchanges: dict[str, str] = {}
+        self.request_controller: Any | None = None
+        self.request_account = self.username or "rqdata"
+        self._history_calendar_scope: tuple[str, str | None, str | None] | None = None
+        self._next_trading_dates: dict[date, date] = {}
 
-    def init(self, output: Callable = print) -> bool:
+    def set_history_calendar_scope(
+        self, job_id: str | None, calendar_snapshot_id: str | None = None,
+        calendar_rule_version: str | None = None,
+    ) -> None:
+        scope = (job_id, calendar_snapshot_id, calendar_rule_version) if job_id else None
+        if scope != getattr(self, "_history_calendar_scope", None):
+            self._next_trading_dates = {}
+        self._history_calendar_scope = scope
+
+    def _next_trading_date(self, end: datetime) -> date:
+        if getattr(self, "_history_calendar_scope", None) is None:
+            return self._request_call("calendar_next_date", get_next_trading_date, end)
+        day = end.date()
+        cache = self._next_trading_dates
+        if day in cache:
+            return cache[day]
+        result = self._request_call("calendar_next_date", get_next_trading_date, end)
+        if isinstance(result, date) and result > day:
+            if len(cache) >= 1024:
+                cache.pop(next(iter(cache)))
+            cache[day] = result
+        return result
+
+    def _request_call(
+        self, endpoint: str, function: Callable[..., Any], *args: Any,
+        ensure_active: Callable[[], None] | None = None, **kwargs: Any,
+    ) -> Any:
+        if ensure_active is not None:
+            ensure_active()
+        controller = getattr(self, "request_controller", None)
+        request = getattr(controller, "request", None)
+        if controller is not None and not callable(request):
+            controller.throttle(
+                self.request_account, endpoint, ensure_active=ensure_active,
+            )
+        scope = request(self.request_account, endpoint, ensure_active=ensure_active) if callable(request) else nullcontext(None)
+        with scope as check:
+            if callable(check):
+                check()
+            if ensure_active is not None:
+                ensure_active()
+            result = function(*args, **kwargs)
+            capture = getattr(self, "calendar_raw_callback", None)
+            if capture is not None:
+                capture(endpoint, args, kwargs, result)
+            if callable(check):
+                check()
+            if ensure_active is not None:
+                ensure_active()
+            return result
+
+    def init(self, output: Callable = print, *, load_instruments: bool = True) -> bool:
         """初始化"""
         if self.inited:
             return True
 
+        self._next_trading_dates = {}
         if not self.username:
             output("RQData数据服务初始化失败：用户名为空！")
             return False
@@ -189,7 +286,8 @@ class RqdataDatafeed(BaseDatafeed):
             return False
 
         try:
-            init(
+            self._request_call(
+                "session_init", init,
                 self.username,
                 self.password,
                 ("rqdatad-pro.ricequant.com", 16011),
@@ -198,7 +296,9 @@ class RqdataDatafeed(BaseDatafeed):
                 auto_load_plugins=False
             )
 
-            self.instruments = all_instruments()
+            self.instruments = self._request_call(
+                "catalog_futures", all_instruments,
+            ) if load_instruments else DataFrame(columns=["order_book_id"])
             self.symbols: ndarray = self.instruments["order_book_id"].to_numpy()
         except RQDataError as ex:
             output(f"RQData数据服务初始化失败：{ex}")
@@ -213,11 +313,19 @@ class RqdataDatafeed(BaseDatafeed):
         self.inited = True
         return True
 
-    def get_instrument_exchanges(self, order_book_ids: list[str]) -> dict[str, str]:
+    @staticmethod
+    def validate_trading_session_sync_settings() -> int:
+        return contract_detail_batch_size()
+
+    def get_instrument_exchanges(
+        self, order_book_ids: list[str], *, ensure_active: Callable[[], None] | None = None,
+    ) -> dict[str, str]:
         """Resolve RQData exchanges in one batch and cache the result."""
         missing = [item for item in order_book_ids if item not in self.instrument_exchanges]
         if missing:
-            resolved = instruments(missing)
+            resolved = self._query_contract_details(
+                missing, **({"ensure_active": ensure_active} if ensure_active is not None else {}),
+            )
             if not isinstance(resolved, list):
                 resolved = [resolved]
             self.instrument_exchanges.update(
@@ -233,23 +341,73 @@ class RqdataDatafeed(BaseDatafeed):
             if order_book_id in self.instrument_exchanges
         }
 
+    def _query_contract_details(
+        self, order_book_ids: list[str], *, ensure_active: Callable[[], None] | None = None,
+    ) -> Any:
+        cache = getattr(self, "_session_sync_cache", None)
+        previous = (cache.get("last_detail_query_at") if cache is not None
+                    else getattr(self, "_last_contract_detail_query_at", None))
+        interval = contract_detail_request_interval_ms() / 1000
+        if previous is not None and interval:
+            remaining = interval - (monotonic() - previous)
+            if remaining > 0:
+                if ensure_active is not None:
+                    ensure_active()
+                sleep(remaining)
+        if ensure_active is not None:
+            ensure_active()
+        started = monotonic()
+        result = self._request_call("instrument_details", instruments, order_book_ids)
+        if ensure_active is not None:
+            ensure_active()
+        self._last_contract_detail_query_at = started
+        if cache is not None:
+            cache["last_detail_query_at"] = started
+        return result
+
     def is_trading_day(self, value: date) -> bool:
         """Return whether the date is in RQData's Chinese trading calendar."""
         if not self.inited and not self.init():
             raise RuntimeError("RQData 数据服务初始化失败")
-        return len(get_trading_dates(value, value)) > 0
+        return len(self._request_call("calendar_days", get_trading_dates, value, value)) > 0
 
-    def get_trading_days(self, start: date, end: date) -> tuple[date, ...]:
+    def begin_trading_session_sync(self) -> None:
+        self._session_sync_cache = {
+            "catalogs": {}, "details": {}, "calendars": {},
+            "last_detail_query_at": getattr(self, "_last_contract_detail_query_at", None),
+        }
+
+    def end_trading_session_sync(self) -> None:
+        self._session_sync_cache = None
+
+    def get_trading_days(
+        self, start: date, end: date, *, ensure_active: Callable[[], None] | None = None,
+    ) -> tuple[date, ...]:
         """Return a date range using a single RQData calendar request."""
         if not self.inited and not self.init():
             raise RuntimeError("RQData 数据服务初始化失败")
-        return tuple(
+        cache = getattr(self, "_session_sync_cache", None)
+        if cache is not None:
+            for (cached_start, cached_end), days in cache["calendars"].items():
+                if cached_start <= start and cached_end >= end:
+                    return tuple(day for day in days if start <= day <= end)
+        if ensure_active is not None:
+            ensure_active()
+        raw_days = self._request_call("calendar_days", get_trading_dates, start, end,
+                                      ensure_active=ensure_active)
+        days = tuple(
             cast(Any, value).date() if hasattr(value, "date") else value
-            for value in get_trading_dates(start, end)
+            for value in raw_days
         )
+        if ensure_active is not None:
+            ensure_active()
+        if cache is not None:
+            cache["calendars"][(start, end)] = days
+        return days
 
     def get_trading_session_snapshot(
-        self, vt_symbols: list[str], trading_date: date, output: Callable = print
+        self, vt_symbols: list[str], trading_date: date, output: Callable = print,
+        *, ensure_active: Callable[[], None] | None = None,
     ) -> dict[str, dict[str, Any]]:
         """Resolve each vt_symbol's exchange-defined session times and instrument status for one date."""
         if not self.inited and not self.init(output):
@@ -268,8 +426,13 @@ class RqdataDatafeed(BaseDatafeed):
             return {}
 
         order_book_ids = list(dict.fromkeys(order_book_id_by_vt_symbol.values()))
-        trading_hours = self._trading_hours_by_order_book_id(order_book_ids, trading_date)
-        statuses = self._instrument_status_by_order_book_id(order_book_ids, trading_date)
+        active_options = {"ensure_active": ensure_active} if ensure_active is not None else {}
+        trading_hours = self._trading_hours_by_order_book_id(order_book_ids, trading_date, **active_options)
+        if ensure_active is not None:
+            ensure_active()
+        statuses = self._instrument_status_by_order_book_id(
+            order_book_ids, trading_date, **active_options,
+        )
         return {
             vt_symbol: {
                 "sessions": _parse_trading_hours(trading_hours.get(order_book_id, "")),
@@ -279,29 +442,89 @@ class RqdataDatafeed(BaseDatafeed):
         }
 
     def get_all_futures_trading_sessions(
-        self, trading_date: date, output: Callable = print
+        self, trading_date: date, output: Callable = print,
+        *, ensure_active: Callable[[], None] | None = None,
+        progress: Callable[[dict[str, Any]], None] | None = None,
+        batch_size: int | None = None,
+        checkpoint_batch_size: int | None = None,
+        batch_checkpoint: Callable[[int, list[str], dict[str, dict[str, Any]] | None],
+                                   dict[str, dict[str, Any]] | None] | None = None,
     ) -> dict[str, dict[str, Any]]:
         """Return session periods and status for every listed domestic futures contract."""
+        return self._get_all_contract_trading_sessions(
+            trading_date, "futures", output, ensure_active=ensure_active, progress=progress,
+            batch_size=batch_size, checkpoint_batch_size=checkpoint_batch_size,
+            batch_checkpoint=batch_checkpoint,
+        )
+
+    def get_all_options_trading_sessions(
+        self, trading_date: date, output: Callable = print,
+        *, ensure_active: Callable[[], None] | None = None,
+        progress: Callable[[dict[str, Any]], None] | None = None,
+        batch_size: int | None = None,
+        checkpoint_batch_size: int | None = None,
+        batch_checkpoint: Callable[[int, list[str], dict[str, dict[str, Any]] | None],
+                                   dict[str, dict[str, Any]] | None] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Return actual session periods and status for domestic derivatives options."""
+        return self._get_all_contract_trading_sessions(
+            trading_date, "options", output, ensure_active=ensure_active, progress=progress,
+            batch_size=batch_size, checkpoint_batch_size=checkpoint_batch_size,
+            batch_checkpoint=batch_checkpoint,
+        )
+
+    def _get_all_contract_trading_sessions(
+        self, trading_date: date, asset_class: str, output: Callable,
+        *, ensure_active: Callable[[], None] | None = None,
+        progress: Callable[[dict[str, Any]], None] | None = None,
+        batch_size: int | None = None,
+        checkpoint_batch_size: int | None = None,
+        batch_checkpoint: Callable[[int, list[str], dict[str, dict[str, Any]] | None],
+                                   dict[str, dict[str, Any]] | None] | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        if batch_size is None:
+            batch_size = contract_detail_batch_size()
+        elif type(batch_size) is not int or batch_size < 1:
+            raise ValueError("batch_size must be a positive integer")
+        if checkpoint_batch_size is not None and (type(checkpoint_batch_size) is not int or checkpoint_batch_size < 1):
+            raise ValueError("checkpoint_batch_size must be a positive integer")
+        checkpoint_size = gcd(batch_size, checkpoint_batch_size or batch_size)
+        active_options = {"ensure_active": ensure_active} if ensure_active is not None else {}
+        if ensure_active is not None:
+            ensure_active()
         if not self.inited and not self.init(output):
             raise RuntimeError("RQData 数据服务初始化失败")
-        refreshed = all_instruments()
+        cache = getattr(self, "_session_sync_cache", None)
+        refreshed = cache["catalogs"].get(asset_class) if cache is not None else None
+        if refreshed is None:
+            if progress is not None:
+                progress({"stage": "catalog", "message": f"下载 {asset_class} 合约目录"})
+            refreshed = self._request_call(
+                "catalog_options" if asset_class == "options" else "catalog_futures",
+                all_instruments, **({"type": "Option"} if asset_class == "options" else {}),
+                ensure_active=ensure_active,
+            )
+            if cache is not None:
+                cache["catalogs"][asset_class] = refreshed
         if refreshed is None or refreshed.empty:
-            raise RuntimeError("RQData returned an empty futures catalog")
-        self.instruments = refreshed
-        self.symbols = refreshed["order_book_id"].to_numpy()
+            raise RuntimeError(f"RQData returned an empty {asset_class} catalog")
+        if asset_class == "futures":
+            self.instruments = refreshed
+            self.symbols = refreshed["order_book_id"].to_numpy()
         candidates: list[tuple[str, Any]] = []
-        for row in self.instruments.itertuples(index=False):
-            if "future" not in str(getattr(row, "type", "")).lower():
+        for row in refreshed.itertuples(index=False):
+            if ("option" if asset_class == "options" else "future") not in str(getattr(row, "type", "")).lower():
                 continue
             order_book_id = str(getattr(row, "order_book_id", "")).strip()
-            if not STANDARD_FUTURES_PATTERN.fullmatch(order_book_id):
+            pattern = STANDARD_OPTIONS_PATTERN if asset_class == "options" else STANDARD_FUTURES_PATTERN
+            if not pattern.fullmatch(order_book_id):
                 continue
             candidates.append((order_book_id, row))
 
         exchange_by_symbol: dict[str, str] = {}
-        if "exchange" not in self.instruments.columns:
+        if "exchange" not in refreshed.columns:
             exchange_by_symbol = self.get_instrument_exchanges(
-                [order_book_id for order_book_id, _ in candidates]
+                [order_book_id for order_book_id, _ in candidates], **active_options,
             )
         contracts: dict[str, tuple[str, str]] = {}
         for order_book_id, row in candidates:
@@ -312,31 +535,114 @@ class RqdataDatafeed(BaseDatafeed):
             if exchange is None:
                 continue
             symbol = order_book_id if exchange in {"CFFEX", "CZCE"} else order_book_id.lower()
+            if asset_class == "options":
+                option = STANDARD_OPTIONS_PATTERN.fullmatch(order_book_id)
+                if option is None:
+                    continue
+                product, delivery, right, strike = option.groups()
+                product = product.upper() if exchange in {"CFFEX", "CZCE"} else product.lower()
+                symbol = f"{product}{delivery}-{right.upper()}-{strike}" if exchange in {"CFFEX", "DCE", "GFEX"} else f"{product}{delivery}{right.upper()}{strike}"
             contracts[order_book_id] = (symbol, exchange)
 
         result: dict[str, dict[str, Any]] = {}
         metadata = {order_book_id: row for order_book_id, row in candidates}
-        calendar = self.get_trading_days(trading_date - timedelta(days=40), trading_date)
+        calendar = self.get_trading_days(trading_date - timedelta(days=40), trading_date, **active_options)
         previous_date = next((value for value in reversed(calendar) if value < trading_date), None)
         is_trading_date = trading_date in calendar
-        order_book_ids = list(contracts)
-        for offset in range(0, len(order_book_ids), 200):
-            batch = order_book_ids[offset : offset + 200]
-            resolved = instruments(batch)
-            if not isinstance(resolved, list):
-                resolved = [resolved]
-            details = {item.order_book_id: item for item in resolved if item is not None}
-            active: list[str] = []
-            for order_book_id in batch:
+        order_book_ids = sorted(contracts) if batch_checkpoint is not None else list(contracts)
+        order_book_id_by_vt_symbol = {
+            f"{symbol}.{exchange}": order_book_id
+            for order_book_id, (symbol, exchange) in contracts.items()
+        } if batch_checkpoint is not None else {}
+        for offset in range(0, len(order_book_ids), batch_size):
+            if ensure_active is not None:
+                ensure_active()
+            batch = order_book_ids[offset : offset + batch_size]
+            batch_number = offset // batch_size + 1
+            batch_vt_symbols = [f"{contracts[symbol][0]}.{contracts[symbol][1]}" for symbol in batch]
+            pending_checkpoints: list[tuple[int, list[str]]] = []
+            if batch_checkpoint is not None:
+                for local_offset in range(0, len(batch), checkpoint_size):
+                    checkpoint_index = (offset + local_offset) // checkpoint_size
+                    checkpoint_symbols = batch_vt_symbols[local_offset:local_offset + checkpoint_size]
+                    cached = batch_checkpoint(checkpoint_index, checkpoint_symbols, None)
+                    if cached is not None:
+                        result.update(cached)
+                    else:
+                        pending_checkpoints.append((checkpoint_index, checkpoint_symbols))
+                if not pending_checkpoints:
+                    continue
+                try:
+                    detail_batch = [
+                        order_book_id_by_vt_symbol[vt_symbol]
+                        for _, checkpoint_symbols in pending_checkpoints
+                        for vt_symbol in checkpoint_symbols
+                    ]
+                except KeyError as exc:
+                    raise RuntimeError("RQData checkpoint references an unknown contract") from exc
+            else:
+                detail_batch = batch
+            if progress is not None:
+                progress({
+                    "stage": "contract_details",
+                    "completed": offset,
+                    "total": len(order_book_ids),
+                    "message": f"查询{asset_class}合约详情，第 {batch_number} 批（已处理 {offset}/{len(order_book_ids)}）",
+                })
+            details_cache = cache["details"] if cache is not None else {}
+            missing = [symbol for symbol in detail_batch if symbol not in details_cache]
+            if missing:
+                resolved = self._query_contract_details(missing, **active_options)
+                if not isinstance(resolved, list):
+                    resolved = [resolved]
+                details_cache.update({item.order_book_id: item for item in resolved if item is not None})
+            details = {symbol: details_cache[symbol] for symbol in detail_batch if symbol in details_cache}
+            active: set[str] = set()
+            period_groups: dict[tuple[str, str], list[str]] = {}
+            batch_result: dict[str, dict[str, Any]] = {}
+            for order_book_id in detail_batch:
                 item = details.get(order_book_id, metadata[order_book_id])
                 listed = self._optional_date(getattr(item, "listed_date", None))
                 last = self._optional_date(getattr(item, "de_listed_date", None))
                 if listed is None or last is None or listed > last:
                     raise ValueError(f"RQData missing/invalid lifecycle: {order_book_id}")
                 if listed <= trading_date <= last:
-                    active.append(order_book_id)
-            trading_hours = self._trading_hours_by_order_book_id(active, trading_date) if active and is_trading_date else {}
-            for order_book_id in batch:
+                    active.add(order_book_id)
+                    underlying = str(getattr(item, "underlying_symbol", "") or "").strip()
+                    if underlying.lower() in {"", "nan", "none"}:
+                        underlying = order_book_id
+                    group = (contracts[order_book_id][1], underlying)
+                    period_groups.setdefault(group, []).append(order_book_id)
+            period_cache = cache.setdefault("trading_hours", {}) if cache is not None else {}
+            missing_groups = {
+                group: symbols for group, symbols in period_groups.items()
+                if (trading_date, asset_class, *group) not in period_cache
+            }
+            if progress is not None:
+                progress({
+                    "stage": "trading_hours_query", "completed": offset, "total": len(order_book_ids),
+                    "message": f"查询{asset_class}交易时段，第 {batch_number} 批（本批 {len(batch)} 个合约，在市 {len(active)} 个，待查 {len(missing_groups)} 个品种，已处理 {offset}/{len(order_book_ids)}）",
+                })
+            queried_hours = self._trading_hours_by_order_book_id(
+                [symbols[0] for symbols in missing_groups.values()], trading_date, **active_options,
+            ) if missing_groups and is_trading_date else {}
+            for group, symbols in missing_groups.items():
+                if symbols[0] in queried_hours:
+                    period_cache[(trading_date, asset_class, *group)] = queried_hours[symbols[0]]
+            trading_hours = {
+                symbol: period_cache[(trading_date, asset_class, *group)]
+                for group, symbols in period_groups.items()
+                if is_trading_date and (trading_date, asset_class, *group) in period_cache
+                for symbol in symbols
+            }
+            if progress is not None:
+                progress({
+                    "stage": "trading_hours",
+                    "completed": min(offset + len(batch), len(order_book_ids)),
+                    "total": len(order_book_ids),
+                    "message": f"已处理 {min(offset + len(batch), len(order_book_ids))}/{len(order_book_ids)} 个{asset_class}合约",
+                })
+            for order_book_id in detail_batch:
                 symbol, exchange = contracts[order_book_id]
                 item = details.get(order_book_id, metadata[order_book_id])
                 listed = self._optional_date(getattr(item, "listed_date", None))
@@ -354,9 +660,10 @@ class RqdataDatafeed(BaseDatafeed):
                     raise ValueError(f"RQData invalid trading periods: {order_book_id}")
                 if is_trading_date and order_book_id in active and status.lower() in {"active", "trading"} and not sessions:
                     raise ValueError(f"RQData missing trading periods: {order_book_id}")
-                result[f"{symbol}.{exchange}"] = {
+                batch_result[f"{symbol}.{exchange}"] = {
                     "symbol": symbol,
                     "exchange": exchange,
+                    "asset_class": asset_class,
                     "sessions": sessions,
                     "status": status,
                     "listed_date": listed,
@@ -366,6 +673,18 @@ class RqdataDatafeed(BaseDatafeed):
                     "delivery_date": self._optional_date(getattr(item, "delivery_date", None)),
                     "previous_trading_date": previous_date,
                 }
+            if batch_checkpoint is not None:
+                for checkpoint_index, checkpoint_symbols in pending_checkpoints:
+                    checkpoint_result = {
+                        symbol: batch_result[symbol] for symbol in checkpoint_symbols
+                        if symbol in batch_result
+                    }
+                    if len(checkpoint_result) != len(checkpoint_symbols):
+                        raise RuntimeError("RQData catalog batch omitted checkpointed contracts")
+                    saved = batch_checkpoint(checkpoint_index, checkpoint_symbols, checkpoint_result)
+                    result.update(saved if saved is not None else checkpoint_result)
+            else:
+                result.update(batch_result)
         return result
 
     @staticmethod
@@ -382,13 +701,21 @@ class RqdataDatafeed(BaseDatafeed):
         except ValueError:
             return None
 
-    @staticmethod
-    def _trading_hours_by_order_book_id(order_book_ids: list[str], trading_date: date) -> dict[str, str]:
+    def _trading_hours_by_order_book_id(
+        self, order_book_ids: list[str], trading_date: date,
+        *, ensure_active: Callable[[], None] | None = None,
+    ) -> dict[str, str]:
         # frequency="tick" returns the exchange-defined session times rather than bar boundaries.
+        if ensure_active is not None:
+            ensure_active()
         frame = cast(
             DataFrame | None,
-            get_trading_periods(order_book_ids, start_date=trading_date, end_date=trading_date, frequency="tick"),
+            self._request_call("trading_periods", get_trading_periods, order_book_ids,
+                               start_date=trading_date, end_date=trading_date, frequency="tick",
+                               ensure_active=ensure_active),
         )
+        if ensure_active is not None:
+            ensure_active()
         if frame is None or frame.empty:
             return {}
         result: dict[str, str] = {}
@@ -397,11 +724,13 @@ class RqdataDatafeed(BaseDatafeed):
             result[str(order_book_id)] = str(row["trading_hours"])
         return result
 
-    @staticmethod
     def _instrument_status_by_order_book_id(
-        order_book_ids: list[str], trading_date: date
+        self, order_book_ids: list[str], trading_date: date,
+        *, ensure_active: Callable[[], None] | None = None,
     ) -> dict[str, str]:
-        resolved = instruments(order_book_ids)
+        resolved = self._query_contract_details(
+            order_book_ids, **({"ensure_active": ensure_active} if ensure_active is not None else {}),
+        )
         if not isinstance(resolved, list):
             resolved = [resolved]
         statuses: dict[str, str] = {}
@@ -432,7 +761,60 @@ class RqdataDatafeed(BaseDatafeed):
         else:
             return self._query_bar_history(req, output)
 
-    def _query_bar_history(self, req: HistoryRequest, output: Callable = print) -> list[BarData] | None:
+    def query_history_batch(
+        self, requests: list[HistoryRequest], output: Callable = print, *, before_convert: Callable | None = None,
+    ) -> list[list[BarData] | list[TickData] | None]:
+        if not requests:
+            return []
+        if not self.inited and not self.init(output):
+            raise RuntimeError("RQData batch initialization failed")
+        first = requests[0]
+        if any(
+            req.exchange not in FUTURES_EXCHANGES or req.symbol.isalpha()
+            or (req.interval, to_china_tz(req.start), to_china_tz(cast(datetime, req.end)))
+            != (first.interval, to_china_tz(first.start), to_china_tz(cast(datetime, first.end)))
+            for req in requests
+        ):
+            raise ValueError("Batch history requires concrete derivatives with matching interval and range")
+        symbols = [to_rq_symbol(req.symbol, req.exchange, self.symbols) for req in requests]
+        if len(set(symbols)) != len(symbols):
+            raise ValueError("Batch history requires unique supported contracts")
+        if any(symbol not in self.symbols for symbol in symbols):
+            results = []
+            for index, req in enumerate(requests):
+                if before_convert is not None:
+                    before_convert(index)
+                results.append(self.query_tick_history(req, output) if req.interval == Interval.TICK
+                               else self.query_bar_history(req, output))
+            return results
+        frequency = "tick" if first.interval == Interval.TICK else INTERVAL_VT2RQ.get(first.interval)
+        if frequency is None:
+            raise ValueError("Unsupported batch history interval")
+        fields = list(HISTORY_TICK_FIELDS) if frequency == "tick" else [
+            "open", "high", "low", "close", "volume", "total_turnover",
+        ]
+        fields.append("open_interest")
+        source_end = self._next_trading_date(to_china_tz(cast(datetime, first.end)))
+        frame = self._request_call(
+            "history_tick" if frequency == "tick" else "history_bar", get_price, symbols,
+            frequency=frequency, fields=fields, start_date=to_china_tz(first.start),
+            end_date=source_end, adjust_type="none",
+        )
+        if frame is not None and not set(frame.index.get_level_values(0)).issubset(symbols):
+            raise ValueError("RQData returned an unexpected contract in batch history")
+        results = []
+        for index, (req, symbol) in enumerate(zip(requests, symbols)):
+            if before_convert is not None:
+                before_convert(index)
+            part = frame.loc[frame.index.get_level_values(0) == symbol].copy() if frame is not None else None
+            source = (part, source_end, symbols)
+            results.append(self._query_tick_history(req, output, source=source) if frequency == "tick"
+                           else self._query_bar_history(req, output, source=source))
+        return results
+
+    def _query_bar_history(
+        self, req: HistoryRequest, output: Callable = print, *, source: tuple | None = None,
+    ) -> list[BarData] | None:
         """查询K线数据"""
         if not self.inited:
             n: bool = self.init(output)
@@ -453,6 +835,8 @@ class RqdataDatafeed(BaseDatafeed):
 
         # 检查查询的代码在范围内
         if rq_symbol not in self.symbols:
+            if re.fullmatch(r"[A-Z]+[0-9]{4}[CP][0-9]+(?:\.[0-9]+)?", rq_symbol):
+                raise ValueError(f"RQData 未返回或不支持该期权合约: {req.vt_symbol}")
             output(f"RQData查询K线数据失败：不支持的合约代码{req.vt_symbol}")
             return []
 
@@ -475,12 +859,12 @@ class RqdataDatafeed(BaseDatafeed):
         else:
             adjust_type = "none"
 
-        df = cast(DataFrame | None, get_price(
+        df = source[0] if source is not None else cast(DataFrame | None, self._request_call("history_bar", get_price,
             rq_symbol,
             frequency=rq_interval,
             fields=fields,
             start_date=start,
-            end_date=get_next_trading_date(end),        # 为了查询夜盘数据
+            end_date=self._next_trading_date(end),
             adjust_type=adjust_type
         ))
 
@@ -519,6 +903,11 @@ class RqdataDatafeed(BaseDatafeed):
         return data
 
     def query_tick_history(self, req: HistoryRequest, output: Callable = print) -> list[TickData] | None:
+        return self._query_tick_history(req, output)
+
+    def _query_tick_history(
+        self, req: HistoryRequest, output: Callable = print, *, source: tuple | None = None,
+    ) -> list[TickData] | None:
         """查询Tick数据"""
         if not self.inited:
             n: bool = self.init(output)
@@ -537,50 +926,22 @@ class RqdataDatafeed(BaseDatafeed):
             rq_symbol = to_rq_symbol(symbol, exchange, self.symbols)
 
         if rq_symbol not in self.symbols:
+            if re.fullmatch(r"[A-Z]+[0-9]{4}[CP][0-9]+(?:\.[0-9]+)?", rq_symbol):
+                raise ValueError(f"RQData 未返回或不支持该期权合约: {req.vt_symbol}")
             output(f"RQData查询Tick数据失败：不支持的合约代码{req.vt_symbol}")
             return []
 
         # 只对衍生品合约才查询持仓量数据
-        fields: list = [
-            "open",
-            "high",
-            "low",
-            "last",
-            "prev_close",
-            "volume",
-            "total_turnover",
-            "limit_up",
-            "limit_down",
-            "b1",
-            "b2",
-            "b3",
-            "b4",
-            "b5",
-            "a1",
-            "a2",
-            "a3",
-            "a4",
-            "a5",
-            "b1_v",
-            "b2_v",
-            "b3_v",
-            "b4_v",
-            "b5_v",
-            "a1_v",
-            "a2_v",
-            "a3_v",
-            "a4_v",
-            "a5_v",
-        ]
+        fields: list = list(HISTORY_TICK_FIELDS)
         if not symbol.isdigit():
             fields.append("open_interest")
 
-        df = cast(DataFrame | None, get_price(
+        df = source[0] if source is not None else cast(DataFrame | None, self._request_call("history_tick", get_price,
             rq_symbol,
             frequency="tick",
             fields=fields,
             start_date=start,
-            end_date=get_next_trading_date(end),        # 为了查询夜盘数据
+            end_date=self._next_trading_date(end),
             adjust_type="none"
         ))
 
@@ -666,12 +1027,12 @@ class RqdataDatafeed(BaseDatafeed):
         if not symbol.isdigit():
             fields.append("open_interest")
 
-        df = cast(DataFrame | None, get_dominant_price(
+        df = cast(DataFrame | None, self._request_call("history_dominant", get_dominant_price,
             symbol.upper(),                         # 合约代码用大写
             frequency=rq_interval,
             fields=fields,
             start_date=start,
-            end_date=get_next_trading_date(end),    # 为了查询夜盘数据
+            end_date=self._next_trading_date(end),
             adjust_type="pre",                      # 前复权
             adjust_method="prev_close_ratio"        # 切换前一日收盘价比例复权
         ))
